@@ -12,7 +12,13 @@ use builder::RateLimiterBuilder;
 use futures::future::{ok, LocalBoxFuture, Ready};
 use std::cell::RefCell;
 use std::{future::Future, rc::Rc};
+use std::collections::HashSet;
+use std::sync::Mutex;
+use lazy_static::lazy_static;
 
+lazy_static! {
+    static ref BLACKLIST_LOGGED: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+}
 type AllowedTransformation<BO> = dyn Fn(&mut HeaderMap, Option<&BO>, bool);
 type DeniedResponse<BO> = dyn Fn(&BO) -> HttpResponse;
 type RollbackCondition = dyn Fn(StatusCode) -> bool;
@@ -131,6 +137,13 @@ where
         let rollback_condition = self.rollback_condition.clone();
 
         Box::pin(async move {
+            let ip_addr = req
+            .connection_info()
+            .realip_remote_addr()
+            .unwrap_or("unknown")
+            .to_string();
+
+
             let input = match input_fn(&req).await {
                 Ok(input) => input,
                 Err(e) => {
@@ -143,6 +156,14 @@ where
                 // Able to successfully query rate limiter backend
                 Ok((decision, output, rollback)) => {
                     if decision.is_denied() {
+                        let ip_addr = req.connection_info().realip_remote_addr().unwrap_or("bilinmiyor").to_string();
+                        {
+                            let mut logged = BLACKLIST_LOGGED.lock().unwrap();
+                            if !logged.contains(&ip_addr) {
+                                log::warn!("This ip entered blacklist: {}", ip_addr);
+                                logged.insert(ip_addr);
+                            }
+                        }
                         let response: HttpResponse = denied_response(&output);
                         return Ok(req.into_response(response).map_into_right_body());
                     }
@@ -163,6 +184,15 @@ where
             };
 
             let mut service_response = service.call(req).await?;
+
+            {
+                let mut logged = BLACKLIST_LOGGED.lock().unwrap();
+                
+                if logged.contains(&ip_addr) {
+                    logged.remove(&ip_addr);
+                    log::info!("This ip removed from blacklist: {}", ip_addr);
+                }
+            }
 
             let mut rolled_back = false;
             if let Some(token) = rollback {
